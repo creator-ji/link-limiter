@@ -10,6 +10,7 @@ import com.linklimiter.service.LinkService;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Scanner;
 import java.util.UUID;
 
@@ -40,6 +41,9 @@ public final class ConsoleApplication {
         boolean running = true;
         while (running) {
             printMenu();
+            if (!scanner.hasNextLine()) {
+                break;
+            }
             String command = scanner.nextLine().trim();
             try {
                 switch (command) {
@@ -53,6 +57,9 @@ public final class ConsoleApplication {
                 }
             } catch (LinkLimiterException | IllegalArgumentException exception) {
                 System.out.println("Ошибка: " + exception.getMessage());
+            } catch (NoSuchElementException | IllegalStateException exception) {
+                System.out.println("Ввод завершён.");
+                running = false;
             }
             System.out.println();
         }
@@ -74,6 +81,9 @@ public final class ConsoleApplication {
         System.out.println("Введите UUID или оставьте строку пустой для нового пользователя:");
         String rawUserId = scanner.nextLine().trim();
         UUID userId = rawUserId.isEmpty() ? null : parseUuid(rawUserId);
+        if (userId != null) {
+            showPendingNotifications(userId);
+        }
 
         System.out.println("Введите исходный URL:");
         String originalUrl = scanner.nextLine();
@@ -85,7 +95,7 @@ public final class ConsoleApplication {
         System.out.println("Сохраните UUID для дальнейшего управления ссылками.");
         System.out.println("Короткая ссылка: " + created.shortUrl());
         System.out.println(
-                "Ссылка действует до: " + DATE_FORMATTER.format(created.link().getExpiresAt())
+                "Ссылка действует до: " + DATE_FORMATTER.format(created.expiresAt())
         );
     }
 
@@ -104,15 +114,9 @@ public final class ConsoleApplication {
 
     private void showUserLinks() {
         UUID userId = readUserId();
-        List<String> notifications = linkService.takeNotifications(userId);
-        if (!notifications.isEmpty()) {
-            System.out.println("Уведомления:");
-            notifications.forEach(message -> System.out.println("- " + message));
-        }
-
         List<ShortLink> links = linkService.getUserLinks(userId);
         if (links.isEmpty()) {
-            System.out.println("У пользователя нет активных ссылок.");
+            System.out.println("У пользователя нет ссылок.");
             return;
         }
 
@@ -150,7 +154,17 @@ public final class ConsoleApplication {
 
     private UUID readUserId() {
         System.out.println("Введите UUID пользователя:");
-        return parseUuid(scanner.nextLine().trim());
+        UUID userId = parseUuid(scanner.nextLine().trim());
+        showPendingNotifications(userId);
+        return userId;
+    }
+
+    private void showPendingNotifications(UUID userId) {
+        List<String> notifications = linkService.takeNotifications(userId);
+        if (!notifications.isEmpty()) {
+            System.out.println("Уведомления:");
+            notifications.forEach(message -> System.out.println("- " + message));
+        }
     }
 
     private UUID parseUuid(String value) {

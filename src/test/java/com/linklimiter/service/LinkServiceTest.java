@@ -5,7 +5,6 @@ import com.linklimiter.exception.LinkLimiterException;
 import com.linklimiter.repository.InMemoryNotificationRepository;
 import com.linklimiter.repository.InMemoryShortLinkRepository;
 import com.linklimiter.repository.InMemoryUserRepository;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -16,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.UUID;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -30,19 +30,7 @@ class LinkServiceTest {
     @BeforeEach
     void setUp() {
         clock = new MutableClock(Instant.parse("2026-01-01T10:00:00Z"));
-        service = new LinkService(
-                new InMemoryUserRepository(),
-                new InMemoryShortLinkRepository(),
-                new InMemoryNotificationRepository(),
-                new ShortCodeGenerator(),
-                new AppConfig("clck.ru/", Duration.ofHours(24), Duration.ofDays(1), 6),
-                clock
-        );
-    }
-
-    @AfterEach
-    void tearDown() {
-        service.close();
+        service = createService(Duration.ofHours(24));
     }
 
     @Test
@@ -52,6 +40,22 @@ class LinkServiceTest {
 
         assertNotEquals(first.userId(), second.userId());
         assertNotEquals(first.shortUrl(), second.shortUrl());
+    }
+
+    @Test
+    void reusesExistingUserAndRejectsUnknownUser() {
+        CreatedLink first = service.createLink(null, "https://example.com/first", 5);
+        CreatedLink second = service.createLink(
+                first.userId(),
+                "https://example.com/second",
+                5
+        );
+
+        assertEquals(first.userId(), second.userId());
+        assertThrows(
+                LinkLimiterException.class,
+                () -> service.createLink(UUID.randomUUID(), "https://example.com", 5)
+        );
     }
 
     @Test
@@ -69,12 +73,16 @@ class LinkServiceTest {
         var notifications = service.takeNotifications(created.userId());
         assertEquals(1, notifications.size());
         assertTrue(notifications.get(0).contains("Лимит переходов"));
+        assertThrows(
+                LinkLimiterException.class,
+                () -> service.accessLink(created.shortUrl())
+        );
+        assertTrue(service.takeNotifications(created.userId()).isEmpty());
     }
 
     @ParameterizedTest(name = "удаляет ссылку после срока жизни {0}")
     @MethodSource("linkLifetimes")
     void removesLinkAtConfiguredLifetimeAndNotifiesOwner(Duration lifetime) {
-        service.close();
         service = createService(lifetime);
         CreatedLink created = service.createLink(null, "https://example.com", 2);
 
@@ -89,33 +97,34 @@ class LinkServiceTest {
     }
 
     @Test
-    void scheduledCleanupAutomaticallyRemovesExpiredLink() throws InterruptedException {
-        service.close();
-        InMemoryShortLinkRepository linkRepository = new InMemoryShortLinkRepository();
-        service = new LinkService(
-                new InMemoryUserRepository(),
-                linkRepository,
-                new InMemoryNotificationRepository(),
-                new ShortCodeGenerator(),
-                new AppConfig(
-                        "clck.ru/",
-                        Duration.ofHours(1),
-                        Duration.ofMillis(10),
-                        6
-                ),
-                clock
-        );
+    void cleanerDeterministicallyRemovesExpiredLink() {
+        CreatedLink created = service.createLink(null, "https://example.com", 2);
+        clock.advance(Duration.ofHours(24));
+
+        try (ExpiredLinkCleaner cleaner = new ExpiredLinkCleaner(
+                service,
+                Duration.ofMinutes(1)
+        )) {
+            assertEquals(1, cleaner.runOnce());
+        }
+        assertTrue(service.getUserLinks(created.userId()).isEmpty());
+        assertTrue(service.takeNotifications(created.userId()).get(0).contains("истёк"));
+    }
+
+    @Test
+    void accessAtExpirationDeletesLinkAndNotifiesOwner() {
+        service = createService(Duration.ofHours(1));
         CreatedLink created = service.createLink(null, "https://example.com", 2);
         clock.advance(Duration.ofHours(1));
 
-        Instant waitDeadline = Instant.now().plusSeconds(2);
-        while (linkRepository.findByCode(created.link().getShortCode()).isPresent()
-                && Instant.now().isBefore(waitDeadline)) {
-            Thread.sleep(10);
-        }
+        LinkLimiterException exception = assertThrows(
+                LinkLimiterException.class,
+                () -> service.accessLink(created.shortUrl())
+        );
 
-        assertTrue(linkRepository.findByCode(created.link().getShortCode()).isEmpty());
-        assertTrue(service.takeNotifications(created.userId()).get(0).contains("истёк"));
+        assertTrue(exception.getMessage().contains("истёк"));
+        assertTrue(service.getUserLinks(created.userId()).isEmpty());
+        assertEquals(1, service.takeNotifications(created.userId()).size());
     }
 
     @Test
@@ -136,11 +145,27 @@ class LinkServiceTest {
         CreatedLink anotherUser = service.createLink(null, "https://example.org", 2);
 
         service.updateClickLimit(ownerLink.userId(), ownerLink.shortUrl(), 5);
-        assertEquals(5, ownerLink.link().getClickLimit());
+        assertEquals(
+                5,
+                service.getUserLinks(ownerLink.userId()).get(0).getClickLimit()
+        );
         assertThrows(
                 LinkLimiterException.class,
                 () -> service.updateClickLimit(anotherUser.userId(), ownerLink.shortUrl(), 6)
         );
+    }
+
+    @Test
+    void newLimitMustExceedCompletedClicks() {
+        CreatedLink created = service.createLink(null, "https://example.com", 3);
+        service.accessLink(created.shortUrl());
+
+        assertThrows(
+                LinkLimiterException.class,
+                () -> service.updateClickLimit(created.userId(), created.shortUrl(), 1)
+        );
+        service.updateClickLimit(created.userId(), created.shortUrl(), 2);
+        assertEquals(2, service.getUserLinks(created.userId()).get(0).getClickLimit());
     }
 
     @Test
@@ -158,6 +183,8 @@ class LinkServiceTest {
                 new InMemoryShortLinkRepository(),
                 new InMemoryNotificationRepository(),
                 new ShortCodeGenerator(),
+                new UrlValidator(),
+                new ShortLinkParser("clck.ru/"),
                 new AppConfig("clck.ru/", linkLifetime, Duration.ofDays(1), 6),
                 clock
         );

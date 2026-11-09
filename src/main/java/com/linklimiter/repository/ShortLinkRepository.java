@@ -11,6 +11,8 @@ public interface ShortLinkRepository {
 
     Optional<ShortLink> findByCode(String shortCode);
 
+    boolean wasCodeUsed(String shortCode);
+
     List<ShortLink> findByOwnerId(UUID ownerId);
 
     List<ShortLink> findAll();

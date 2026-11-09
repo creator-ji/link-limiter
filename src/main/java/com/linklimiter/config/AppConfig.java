@@ -24,8 +24,8 @@ public record AppConfig(
         if (linkLifetime == null || linkLifetime.isNegative() || linkLifetime.isZero()) {
             throw new IllegalArgumentException("Время жизни ссылки должно быть положительным");
         }
-        if (cleanupInterval == null || cleanupInterval.isNegative() || cleanupInterval.isZero()) {
-            throw new IllegalArgumentException("Интервал очистки должен быть положительным");
+        if (cleanupInterval == null || cleanupInterval.toMillis() <= 0) {
+            throw new IllegalArgumentException("Интервал очистки должен быть не меньше 1 мс");
         }
         if (shortCodeLength < 4) {
             throw new IllegalArgumentException("Длина короткого кода должна быть не меньше 4");

@@ -25,13 +25,30 @@ public final class ShortLink {
             Instant createdAt,
             Instant expiresAt
     ) {
-        this.id = Objects.requireNonNull(id);
-        this.ownerId = Objects.requireNonNull(ownerId);
-        this.originalUrl = Objects.requireNonNull(originalUrl);
-        this.shortCode = Objects.requireNonNull(shortCode);
+        this.id = Objects.requireNonNull(id, "ID ссылки не может быть null");
+        this.ownerId = Objects.requireNonNull(ownerId, "ID владельца не может быть null");
+        this.originalUrl = Objects.requireNonNull(originalUrl, "Исходный URL не может быть null");
+        if (shortCode == null || shortCode.isBlank()) {
+            throw new IllegalArgumentException("Короткий код не может быть пустым");
+        }
+        if (clickLimit <= 0) {
+            throw new IllegalArgumentException("Лимит переходов должен быть положительным");
+        }
+        this.createdAt = Objects.requireNonNull(
+                createdAt,
+                "Время создания не может быть null"
+        );
+        this.expiresAt = Objects.requireNonNull(
+                expiresAt,
+                "Время окончания не может быть null"
+        );
+        if (!expiresAt.isAfter(createdAt)) {
+            throw new IllegalArgumentException(
+                    "Время окончания должно быть позже времени создания"
+            );
+        }
+        this.shortCode = shortCode;
         this.clickLimit = clickLimit;
-        this.createdAt = Objects.requireNonNull(createdAt);
-        this.expiresAt = Objects.requireNonNull(expiresAt);
         this.status = LinkStatus.ACTIVE;
     }
 
@@ -46,13 +63,7 @@ public final class ShortLink {
     }
 
     public void markExpired() {
-        if (status != LinkStatus.DELETED) {
-            status = LinkStatus.EXPIRED;
-        }
-    }
-
-    public void markDeleted() {
-        status = LinkStatus.DELETED;
+        status = LinkStatus.EXPIRED;
     }
 
     public void updateClickLimit(int newClickLimit) {

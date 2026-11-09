@@ -13,9 +13,13 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class InMemoryShortLinkRepository implements ShortLinkRepository {
     private final Map<String, ShortLink> linksByCode = new ConcurrentHashMap<>();
     private final Map<UUID, Set<String>> codesByOwner = new ConcurrentHashMap<>();
+    private final Set<String> usedCodes = ConcurrentHashMap.newKeySet();
 
     @Override
     public ShortLink save(ShortLink link) {
+        if (!usedCodes.add(link.getShortCode())) {
+            throw new IllegalArgumentException("Короткий код уже использовался");
+        }
         linksByCode.put(link.getShortCode(), link);
         codesByOwner
                 .computeIfAbsent(link.getOwnerId(), ignored -> ConcurrentHashMap.newKeySet())
@@ -26,6 +30,11 @@ public final class InMemoryShortLinkRepository implements ShortLinkRepository {
     @Override
     public Optional<ShortLink> findByCode(String shortCode) {
         return Optional.ofNullable(linksByCode.get(shortCode));
+    }
+
+    @Override
+    public boolean wasCodeUsed(String shortCode) {
+        return usedCodes.contains(shortCode);
     }
 
     @Override

@@ -10,52 +10,43 @@ import com.linklimiter.repository.ShortLinkRepository;
 import com.linklimiter.repository.UserRepository;
 
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Locale;
+import java.util.Objects;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
-public final class LinkService implements AutoCloseable {
+public final class LinkService {
+    private static final int MAX_CODE_GENERATION_ATTEMPTS = 1_000;
+
     private final UserRepository userRepository;
     private final ShortLinkRepository linkRepository;
     private final NotificationRepository notificationRepository;
     private final ShortCodeGenerator codeGenerator;
+    private final UrlValidator urlValidator;
+    private final ShortLinkParser shortLinkParser;
     private final AppConfig config;
     private final Clock clock;
-    private final ScheduledExecutorService cleanupExecutor;
 
     public LinkService(
             UserRepository userRepository,
             ShortLinkRepository linkRepository,
             NotificationRepository notificationRepository,
             ShortCodeGenerator codeGenerator,
+            UrlValidator urlValidator,
+            ShortLinkParser shortLinkParser,
             AppConfig config,
             Clock clock
     ) {
-        this.userRepository = userRepository;
-        this.linkRepository = linkRepository;
-        this.notificationRepository = notificationRepository;
-        this.codeGenerator = codeGenerator;
-        this.config = config;
-        this.clock = clock;
-        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(task -> {
-            Thread thread = new Thread(task, "expired-links-cleaner");
-            thread.setDaemon(true);
-            return thread;
-        });
-        long intervalMillis = config.cleanupInterval().toMillis();
-        cleanupExecutor.scheduleAtFixedRate(
-                this::cleanupExpiredLinksSafely,
-                intervalMillis,
-                intervalMillis,
-                TimeUnit.MILLISECONDS
-        );
+        this.userRepository = Objects.requireNonNull(userRepository);
+        this.linkRepository = Objects.requireNonNull(linkRepository);
+        this.notificationRepository = Objects.requireNonNull(notificationRepository);
+        this.codeGenerator = Objects.requireNonNull(codeGenerator);
+        this.urlValidator = Objects.requireNonNull(urlValidator);
+        this.shortLinkParser = Objects.requireNonNull(shortLinkParser);
+        this.config = Objects.requireNonNull(config);
+        this.clock = Objects.requireNonNull(clock);
     }
 
     public synchronized CreatedLink createLink(UUID requestedUserId, String rawUrl, int clickLimit) {
@@ -63,7 +54,7 @@ public final class LinkService implements AutoCloseable {
             throw new LinkLimiterException("Лимит переходов должен быть положительным числом");
         }
 
-        URI originalUrl = parseAndValidateUrl(rawUrl);
+        URI originalUrl = urlValidator.validate(rawUrl);
         User user = resolveUser(requestedUserId);
         String shortCode = generateUniqueCode();
         Instant createdAt = clock.instant();
@@ -77,11 +68,15 @@ public final class LinkService implements AutoCloseable {
                 createdAt.plus(config.linkLifetime())
         );
         linkRepository.save(link);
-        return new CreatedLink(user.id(), config.shortLinkPrefix() + shortCode, link);
+        return new CreatedLink(
+                user.id(),
+                buildShortUrl(shortCode),
+                link.getExpiresAt()
+        );
     }
 
     public synchronized LinkAccess accessLink(String shortUrlOrCode) {
-        String shortCode = extractShortCode(shortUrlOrCode);
+        String shortCode = shortLinkParser.parse(shortUrlOrCode);
         ShortLink link = linkRepository.findByCode(shortCode)
                 .orElseThrow(() -> new LinkLimiterException("Короткая ссылка не найдена"));
 
@@ -101,7 +96,7 @@ public final class LinkService implements AutoCloseable {
             notificationRepository.add(
                     link.getOwnerId(),
                     "Лимит переходов для ссылки "
-                            + config.shortLinkPrefix() + link.getShortCode()
+                            + buildShortUrl(link.getShortCode())
                             + " исчерпан"
             );
         }
@@ -113,7 +108,7 @@ public final class LinkService implements AutoCloseable {
 
     public synchronized List<ShortLink> getUserLinks(UUID userId) {
         requireExistingUser(userId);
-        cleanupExpiredLinks();
+        cleanupExpiredLinks(linkRepository.findByOwnerId(userId));
         return linkRepository.findByOwnerId(userId).stream()
                 .sorted(Comparator.comparing(ShortLink::getCreatedAt))
                 .toList();
@@ -121,9 +116,8 @@ public final class LinkService implements AutoCloseable {
 
     public synchronized void deleteLink(UUID userId, String shortUrlOrCode) {
         requireExistingUser(userId);
-        String shortCode = extractShortCode(shortUrlOrCode);
+        String shortCode = shortLinkParser.parse(shortUrlOrCode);
         ShortLink link = requireOwnedLink(userId, shortCode);
-        link.markDeleted();
         linkRepository.delete(link);
     }
 
@@ -136,7 +130,7 @@ public final class LinkService implements AutoCloseable {
         if (newClickLimit <= 0) {
             throw new LinkLimiterException("Лимит переходов должен быть положительным числом");
         }
-        String shortCode = extractShortCode(shortUrlOrCode);
+        String shortCode = shortLinkParser.parse(shortUrlOrCode);
         ShortLink link = requireOwnedLink(userId, shortCode);
         if (link.isExpiredAt(clock.instant())) {
             expireAndDelete(link);
@@ -145,20 +139,24 @@ public final class LinkService implements AutoCloseable {
         try {
             link.updateClickLimit(newClickLimit);
         } catch (IllegalArgumentException | IllegalStateException exception) {
-            throw new LinkLimiterException(exception.getMessage());
+            throw new LinkLimiterException(exception.getMessage(), exception);
         }
     }
 
     public synchronized List<String> takeNotifications(UUID userId) {
         requireExistingUser(userId);
-        cleanupExpiredLinks();
+        cleanupExpiredLinks(linkRepository.findByOwnerId(userId));
         return notificationRepository.takeAll(userId);
     }
 
     public synchronized int cleanupExpiredLinks() {
+        return cleanupExpiredLinks(linkRepository.findAll());
+    }
+
+    private int cleanupExpiredLinks(List<ShortLink> links) {
         int deletedCount = 0;
         Instant now = clock.instant();
-        for (ShortLink link : linkRepository.findAll()) {
+        for (ShortLink link : links) {
             if (link.isExpiredAt(now)) {
                 expireAndDelete(link);
                 deletedCount++;
@@ -167,20 +165,12 @@ public final class LinkService implements AutoCloseable {
         return deletedCount;
     }
 
-    private void cleanupExpiredLinksSafely() {
-        try {
-            cleanupExpiredLinks();
-        } catch (RuntimeException exception) {
-            System.err.println("Не удалось очистить просроченные ссылки: " + exception.getMessage());
-        }
-    }
-
     private void expireAndDelete(ShortLink link) {
         link.markExpired();
         notificationRepository.add(
                 link.getOwnerId(),
                 "Срок действия ссылки "
-                        + config.shortLinkPrefix() + link.getShortCode()
+                        + buildShortUrl(link.getShortCode())
                         + " истёк. Создайте новую ссылку"
         );
         linkRepository.delete(link);
@@ -210,55 +200,18 @@ public final class LinkService implements AutoCloseable {
     }
 
     private String generateUniqueCode() {
-        String code;
-        do {
-            code = codeGenerator.generate(config.shortCodeLength());
-        } while (linkRepository.findByCode(code).isPresent());
-        return code;
-    }
-
-    private URI parseAndValidateUrl(String rawUrl) {
-        if (rawUrl == null || rawUrl.isBlank()) {
-            throw new LinkLimiterException("URL не может быть пустым");
-        }
-        try {
-            URI uri = new URI(rawUrl.trim());
-            String scheme = uri.getScheme();
-            if (scheme == null
-                    || (!scheme.toLowerCase(Locale.ROOT).equals("http")
-                    && !scheme.toLowerCase(Locale.ROOT).equals("https"))
-                    || uri.getHost() == null) {
-                throw new LinkLimiterException(
-                        "Введите абсолютный URL с протоколом http или https"
-                );
-            }
-            return uri;
-        } catch (URISyntaxException exception) {
-            throw new LinkLimiterException("Некорректный URL");
-        }
-    }
-
-    private String extractShortCode(String shortUrlOrCode) {
-        if (shortUrlOrCode == null || shortUrlOrCode.isBlank()) {
-            throw new LinkLimiterException("Короткая ссылка не может быть пустой");
-        }
-        String value = shortUrlOrCode.trim();
-        if (value.startsWith(config.shortLinkPrefix())) {
-            value = value.substring(config.shortLinkPrefix().length());
-        } else {
-            int slashIndex = value.lastIndexOf('/');
-            if (slashIndex >= 0) {
-                value = value.substring(slashIndex + 1);
+        for (int attempt = 0; attempt < MAX_CODE_GENERATION_ATTEMPTS; attempt++) {
+            String code = codeGenerator.generate(config.shortCodeLength());
+            if (!linkRepository.wasCodeUsed(code)) {
+                return code;
             }
         }
-        if (value.isBlank()) {
-            throw new LinkLimiterException("Короткая ссылка имеет неверный формат");
-        }
-        return value;
+        throw new LinkLimiterException(
+                "Не удалось создать уникальный короткий код. Повторите попытку"
+        );
     }
 
-    @Override
-    public void close() {
-        cleanupExecutor.shutdownNow();
+    private String buildShortUrl(String shortCode) {
+        return config.shortLinkPrefix() + shortCode;
     }
 }
