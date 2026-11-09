@@ -8,13 +8,15 @@ import com.linklimiter.repository.InMemoryUserRepository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
-import java.util.UUID;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -64,16 +66,55 @@ class LinkServiceTest {
                 () -> service.accessLink(created.shortUrl())
         );
         assertTrue(exception.getMessage().contains("Лимит переходов исчерпан"));
-        assertEquals(1, service.takeNotifications(created.userId()).size());
+        var notifications = service.takeNotifications(created.userId());
+        assertEquals(1, notifications.size());
+        assertTrue(notifications.get(0).contains("Лимит переходов"));
+    }
+
+    @ParameterizedTest(name = "удаляет ссылку после срока жизни {0}")
+    @MethodSource("linkLifetimes")
+    void removesLinkAtConfiguredLifetimeAndNotifiesOwner(Duration lifetime) {
+        service.close();
+        service = createService(lifetime);
+        CreatedLink created = service.createLink(null, "https://example.com", 2);
+
+        clock.advance(lifetime.minusSeconds(1));
+        assertEquals(0, service.cleanupExpiredLinks());
+        assertEquals(1, service.getUserLinks(created.userId()).size());
+
+        clock.advance(Duration.ofSeconds(1));
+        assertEquals(1, service.cleanupExpiredLinks());
+        assertTrue(service.getUserLinks(created.userId()).isEmpty());
+        assertTrue(service.takeNotifications(created.userId()).get(0).contains("истёк"));
     }
 
     @Test
-    void removesExpiredLinkAndNotifiesOwner() {
+    void scheduledCleanupAutomaticallyRemovesExpiredLink() throws InterruptedException {
+        service.close();
+        InMemoryShortLinkRepository linkRepository = new InMemoryShortLinkRepository();
+        service = new LinkService(
+                new InMemoryUserRepository(),
+                linkRepository,
+                new InMemoryNotificationRepository(),
+                new ShortCodeGenerator(),
+                new AppConfig(
+                        "clck.ru/",
+                        Duration.ofHours(1),
+                        Duration.ofMillis(10),
+                        6
+                ),
+                clock
+        );
         CreatedLink created = service.createLink(null, "https://example.com", 2);
-        clock.advance(Duration.ofHours(24));
+        clock.advance(Duration.ofHours(1));
 
-        assertEquals(1, service.cleanupExpiredLinks());
-        assertTrue(service.getUserLinks(created.userId()).isEmpty());
+        Instant waitDeadline = Instant.now().plusSeconds(2);
+        while (linkRepository.findByCode(created.link().getShortCode()).isPresent()
+                && Instant.now().isBefore(waitDeadline)) {
+            Thread.sleep(10);
+        }
+
+        assertTrue(linkRepository.findByCode(created.link().getShortCode()).isEmpty());
         assertTrue(service.takeNotifications(created.userId()).get(0).contains("истёк"));
     }
 
@@ -109,6 +150,21 @@ class LinkServiceTest {
                 LinkLimiterException.class,
                 () -> service.createLink(null, "https://example.com", 0)
         );
+    }
+
+    private LinkService createService(Duration linkLifetime) {
+        return new LinkService(
+                new InMemoryUserRepository(),
+                new InMemoryShortLinkRepository(),
+                new InMemoryNotificationRepository(),
+                new ShortCodeGenerator(),
+                new AppConfig("clck.ru/", linkLifetime, Duration.ofDays(1), 6),
+                clock
+        );
+    }
+
+    private static Stream<Duration> linkLifetimes() {
+        return Stream.of(Duration.ofHours(1), Duration.ofHours(24));
     }
 
     private static final class MutableClock extends Clock {
