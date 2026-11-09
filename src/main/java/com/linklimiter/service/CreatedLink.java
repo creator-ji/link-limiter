@@ -1,8 +1,6 @@
 package com.linklimiter.service;
 
-import com.linklimiter.model.ShortLink;
-
+import java.time.Instant;
 import java.util.UUID;
 
-public record CreatedLink(UUID userId, String shortUrl, ShortLink link) {
-}
+public record CreatedLink(UUID userId, String shortUrl, Instant expiresAt) {}
